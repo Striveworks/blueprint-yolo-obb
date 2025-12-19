@@ -1,0 +1,208 @@
+{
+  "$defs": {
+    "Checkpoint": {
+      "properties": {
+        "checkpoint_id": {
+          "title": "Checkpoint Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "checkpoint_id"
+      ],
+      "title": "Checkpoint",
+      "type": "object"
+    },
+    "DatasetSnapshot": {
+      "properties": {
+        "snapshot_id": {
+          "title": "Snapshot Id",
+          "type": "string"
+        },
+        "split": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Split"
+        }
+      },
+      "required": [
+        "snapshot_id"
+      ],
+      "title": "DatasetSnapshot",
+      "type": "object"
+    },
+    "Datasets": {
+      "properties": {
+        "train_data": {
+          "items": {
+            "$ref": "#/$defs/DatasetSnapshot"
+          },
+          "minItems": 1,
+          "title": "Train Data",
+          "type": "array"
+        },
+        "val_data": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/DatasetSnapshot"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Val Data"
+        }
+      },
+      "required": [
+        "train_data",
+        "val_data"
+      ],
+      "title": "Datasets",
+      "type": "object"
+    },
+    "Model": {
+      "properties": {
+        "model_id": {
+          "title": "Model Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_id"
+      ],
+      "title": "Model",
+      "type": "object"
+    },
+    "YoloDatasets": {
+      "properties": {
+        "data_root": {
+          "format": "directory-path",
+          "title": "Data Root",
+          "type": "string"
+        }
+      },
+      "required": [
+        "data_root"
+      ],
+      "title": "YoloDatasets",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "datasets": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Datasets"
+        },
+        {
+          "$ref": "#/$defs/YoloDatasets"
+        }
+      ],
+      "title": "Datasets"
+    },
+    "class_to_idx": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Class To Idx"
+    },
+    "idx_to_class": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Idx To Class"
+    },
+    "start_model": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Model"
+        },
+        {
+          "$ref": "#/$defs/Checkpoint"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Start Model"
+    },
+    "ckpt_epoch_period": {
+      "default": 5,
+      "exclusiveMinimum": 0,
+      "title": "Ckpt Epoch Period",
+      "type": "integer"
+    },
+    "log_level": {
+      "default": "INFO",
+      "enum": [
+        "CRITICAL",
+        "FATAL",
+        "ERROR",
+        "WARN",
+        "WARNING",
+        "INFO",
+        "DEBUG",
+        "NOTSET"
+      ],
+      "title": "Log Level",
+      "type": "string"
+    },
+    "epochs": {
+      "default": 100,
+      "title": "Epochs",
+      "type": "integer"
+    },
+    "batch_size": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "default": 16,
+      "title": "Batch Size"
+    },
+    "resize_to": {
+      "default": 640,
+      "title": "Resize To",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "datasets"
+  ],
+  "title": "Config",
+  "type": "object"
+}
