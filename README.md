@@ -39,14 +39,6 @@ Supports configuration options including:
 - Training hyperparameters (epochs, batch size, image size)
 - Class mappings
 
-### Inference Handler (`data/handler.py`)
-
-TorchServe-compatible handler for model inference:
-- `Handler`: Extends TorchServe's ObjectDetector for OBB predictions
-- Preprocesses input images
-- Runs inference with YOLO OBB models
-- Post-processes results to oriented bounding box format
-
 ### Utilities
 
 - `data/util.py`: Converts YOLO results to standardized oriented bounding box format
