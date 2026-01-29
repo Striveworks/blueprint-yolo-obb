@@ -5,12 +5,10 @@ import logging
 import math
 import shutil
 import tempfile
-import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from functools import partial
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +17,8 @@ import numpy as np
 import torch
 from blueprint_toolkit import (
     Checkpoint,
+    CheckpointEngineSelector,
+    CheckpointInferenceServerSettingsDict,
     CheckpointNotFoundError,
     Model,
     ModelConfigDict,
@@ -27,7 +27,6 @@ from blueprint_toolkit import (
 )
 from chariot_valor.lite import Loader as ValorLoader
 from chariot_valor.lite import TaskType
-from model_archiver.model_packaging import ModelArchiverConfig, generate_model_archive
 from PIL import Image
 from ultralytics import YOLO
 from ultralytics.models.yolo.obb.train import OBBTrainer
@@ -35,80 +34,47 @@ from ultralytics.models.yolo.obb.val import OBBValidator
 from ultralytics.utils import DEFAULT_CFG, LOGGER, ops
 from ultralytics.utils.callbacks import get_default_callbacks
 
-import blueprint_yolo_obb
 from blueprint_yolo_obb.src.config import Config, Datasets, YoloDatasets
-from blueprint_yolo_obb.src.data.util import convert_yolo_results
+from blueprint_yolo_obb.src.util import convert_yolo_results
 from blueprint_yolo_obb.src.yolo_yaml import get_yolo_file
 
-MODEL_MAR_NAME = "model"
+MODEL_PT_NAME = "model.pt"
 CHARIOT_VALOR_EVALUATIONS_FILE_NAME = "chariot_valor_evaluations.json.gz"
 
 
 def save_model(
     last_pt_file: Path,
     checkpoint_dir: Path,
-    idx_to_class: dict[int, str],
-    resize_to: int = 640,
 ):
-    with (
-        resources.as_file(
-            resources.files(blueprint_yolo_obb).joinpath(
-                str(Path("src") / "data" / "handler.py")
-            ),
-        ) as handler_file_path,
-        resources.as_file(
-            resources.files(blueprint_yolo_obb).joinpath(
-                str(Path("src") / "data" / "util.py")
-            ),
-        ) as util_file_path,
-        resources.as_file(
-            resources.files(blueprint_yolo_obb).joinpath(
-                str(Path("src") / "data" / "requirements.txt")
-            ),
-        ) as requirements_file_path,
-        tempfile.TemporaryDirectory() as tmp_dir,
-    ):
-        model_store_dir = checkpoint_dir / "model-store"
-        model_store_dir.mkdir(exist_ok=True)
-
-        model_config = {"idx_to_class": idx_to_class, "resize_to": resize_to}
-        model_config_path = Path(tmp_dir) / "model_config.json"
-        with open(model_config_path, "w") as fp:
-            json.dump(model_config, fp)
-
-        extra_files = ",".join(
-            str(path) for path in [model_config_path, util_file_path]
-        )
-        generate_model_archive(
-            config=ModelArchiverConfig(
-                model_name=MODEL_MAR_NAME,
-                handler=str(handler_file_path),
-                serialized_file=str(last_pt_file),
-                version="1.0.0",
-                export_path=str(model_store_dir),
-                requirements_file=str(requirements_file_path),
-                extra_files=extra_files,
-            )
-        )
-
+    if not last_pt_file.exists():
+        raise ValueError(f"last_pt_file {str(last_pt_file)!r} does not exist")
+    model = YOLO(last_pt_file, task="obb")
+    model.save(str(checkpoint_dir / MODEL_PT_NAME))
+    idx_to_class = model.names
     with open(checkpoint_dir / "chariot_model_config.json", "w") as fp:
+        engine_selector = CheckpointEngineSelector(
+            org_name="Chariot",
+            project_name="Common",
+            engine_name="yolo-obb",
+        )
         json.dump(
             ModelConfigDict(
-                artifact_type="pytorch",
+                artifact_type="custom-engine",
                 class_labels={cls: idx for idx, cls in idx_to_class.items()},
-                copy_key_suffixes=[f"model-store/{MODEL_MAR_NAME}.mar"],
+                copy_key_suffixes=[MODEL_PT_NAME],
+                isvc_settings=CheckpointInferenceServerSettingsDict(
+                    engine_selector=engine_selector
+                ),
+                supported_engines=[engine_selector],
             ),
             fp,
         )
 
 
 def load_model(dir: Path):
+    # TODO(s.maddox): simplify model loading to not make a copy?
     temp_model_pt_file = tempfile.NamedTemporaryFile("wb", suffix=".pt", delete=False)
-
-    with zipfile.ZipFile(dir / "model-store" / f"{MODEL_MAR_NAME}.mar", "r") as zfp:
-        manifest = json.loads(zfp.read("MAR-INF/MANIFEST.json"))
-        with zfp.open(manifest["model"]["serializedFile"]) as zip_model_pt_file:
-            temp_model_pt_file.write(zip_model_pt_file.read())
+    temp_model_pt_file.write((dir / MODEL_PT_NAME).read_bytes())
     return temp_model_pt_file
 
 
@@ -249,12 +215,13 @@ class Callbacks:
             )
             return
 
-        # save valor metrics
+        # save metrics
         valor_metrics = []
         model = YOLO(trainer.last, task="obb")
         config = Config.model_validate(self.run_context.load_config())
 
         if type(config.datasets) is YoloDatasets:
+            assert trainer.validator  # to appease the the type checker
             valor_metrics.append(
                 convert_yolo_results_to_valor_metrics(
                     trainer.validator,
@@ -267,6 +234,7 @@ class Callbacks:
 
         if type(config.datasets) is Datasets:
             for t in config.datasets.val_data or []:
+                assert trainer.validator  # to appease the the type checker
                 valor_metrics.append(
                     convert_yolo_results_to_valor_metrics(
                         trainer.validator,
@@ -276,6 +244,8 @@ class Callbacks:
                         t.split,
                     )
                 )
+
+        del model, config
 
         teddy_metrics = [
             SaveMetricDict(
@@ -300,7 +270,7 @@ class Callbacks:
             logging.info(f"Saving checkpoint at step {self.global_step}")
 
             with self.run_context.save_checkpoint(self.global_step) as ckpt:
-                save_model(trainer.last, ckpt.dir, idx_to_class, config.resize_to)
+                save_model(trainer.last, ckpt.dir)
 
                 if len(valor_metrics) > 0:
                     with open(
@@ -677,6 +647,7 @@ def train(run_context: RunContext):
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
             train_kwargs = {
+                # TODO: do we need to be specifying names, here?
                 "data": f.name,
                 "epochs": config.epochs,
                 "batch": config.batch_size,

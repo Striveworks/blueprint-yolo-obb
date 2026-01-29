@@ -6,7 +6,6 @@ import os
 import shutil
 import tempfile
 import unittest
-import zipfile
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -17,17 +16,23 @@ import pytest
 import torch
 from blueprint_toolkit import (
     Checkpoint,
+    CheckpointEngineSelector,
+    CheckpointInferenceServerSettingsDict,
     CheckpointNotFoundError,
     DatasetSnapshot,
     MemoryMetricSaver,
     MemoryProgressSaver,
+    ModelConfigDict,
     RunContext,
     local_run_context,
 )
+from ultralytics import YOLO
+from ultralytics.nn.tasks import DetectionModel
 
 from blueprint_yolo_obb.src.config import Config, Datasets, YoloDatasets
 from blueprint_yolo_obb.src.train import (
     CHARIOT_VALOR_EVALUATIONS_FILE_NAME,
+    MODEL_PT_NAME,
     Callbacks,
     fetch_datums,
     load_checkpoint_or_init_model,
@@ -490,45 +495,41 @@ def test_save_model_load_model(
     expected_class_labels: dict[str, int],
 ):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".pt") as last_pt_file:
-        torch.save(ModelClass(), last_pt_file.name)
+        model = YOLO("yolov8n-obb.yaml", task="obb")
+        assert isinstance(model.model, DetectionModel)
+        model.model.names = {int(id): label for id, label in idx_to_class.items()}
+        model.save(last_pt_file.name)
         with tempfile.TemporaryDirectory() as checkpoint_dir:
             save_model(
                 Path(last_pt_file.name),
                 Path(checkpoint_dir),
-                idx_to_class,
-                320,
             )
-            mar_file = Path(checkpoint_dir) / "model-store" / "model.mar"
-            with zipfile.ZipFile(mar_file) as mar_f:
-                file_names = [f.filename for f in mar_f.filelist]
-                last_pt_file_name = os.path.basename(last_pt_file.name)
-                assert last_pt_file_name in file_names
-                manifest = json.loads(mar_f.read("MAR-INF/MANIFEST.json"))
-                assert manifest["model"]["serializedFile"] == last_pt_file_name
-                assert manifest["model"]["handler"] == "handler.py"
-                requirements = mar_f.read("requirements.txt")
-                assert "ultralytics" in str(requirements)
-                if idx_to_class:
-                    assert "model_config.json" in file_names
-                    with mar_f.open("model_config.json", "r") as f:
-                        assert json.load(f) == {
-                            "idx_to_class": {
-                                str(i): c for i, c in idx_to_class.items()
-                            },
-                            "resize_to": 320,
-                        }
-                else:
-                    assert "model_config.json" not in file_names
+
+            # confirm a valid `model.pt` was saved
+            model_pt_path = Path(checkpoint_dir) / MODEL_PT_NAME
+            assert model_pt_path.exists()
+            assert YOLO(model_pt_path, task="obb")
+
+            # confirm the correct `chariot_model_config.json` was saved
+            engine_selector = CheckpointEngineSelector(
+                org_name="Chariot",
+                project_name="Common",
+                engine_name="yolo-obb",
+            )
             assert json.loads(
                 (Path(checkpoint_dir) / "chariot_model_config.json").read_text()
-            ) == {
-                "artifact_type": "pytorch",
-                "class_labels": expected_class_labels,
-                "copy_key_suffixes": ["model-store/model.mar"],
-            }
+            ) == ModelConfigDict(
+                artifact_type="custom-engine",
+                class_labels=expected_class_labels,
+                copy_key_suffixes=[MODEL_PT_NAME],
+                isvc_settings=CheckpointInferenceServerSettingsDict(
+                    engine_selector=engine_selector
+                ),
+                supported_engines=[engine_selector],
+            )
 
             with load_model(Path(checkpoint_dir)) as temp_pt_file:
-                assert type(torch.load(temp_pt_file.name)) is ModelClass
+                assert YOLO(temp_pt_file.name, "obb")
 
 
 @pytest.mark.slow  # TODO(scohen): Consider this an integration/medium test?
@@ -580,7 +581,7 @@ def test_train_local_run_context():
                     15,
                 }
                 with r.load_checkpoint() as ckpt:
-                    assert (ckpt.dir / "model-store" / "model.mar").exists()
+                    assert (ckpt.dir / MODEL_PT_NAME).exists()
                     # Save checkpoint every 2 epochs, each epoch is 3 global steps, so we
                     # should have checkpoints at global step == 6 and 12
                     assert int(ckpt.dir.name.split("-")[0]) == 12
@@ -650,7 +651,7 @@ def test_train_local_run_context():
                     )
                 )
                 with r.load_checkpoint() as ckpt:
-                    assert (ckpt.dir / "model-store" / "model.mar").exists()
+                    assert (ckpt.dir / MODEL_PT_NAME).exists()
                     assert int(ckpt.dir.name.split("-")[0]) == 6
 
 
