@@ -263,6 +263,60 @@ def test_callbacks_on_train_batch_start():
     assert callbacks.global_step == 3
 
 
+@pytest.mark.parametrize(
+    "is_cuda_available,device_count,requested_devices,expected_device",
+    [
+        (False, 0, 0, "cpu"),
+        (True, 1, 1, "cuda"),
+        (True, 2, 2, [0, 1]),
+        (True, 4, 4, [0, 1, 2, 3]),
+        (True, 1, 2, RuntimeError),
+    ],
+)
+@patch("blueprint_yolo_obb.src.train.load_checkpoint_or_init_model")
+@patch("blueprint_yolo_obb.src.train.torch.cuda.device_count")
+@patch("blueprint_yolo_obb.src.train.torch.cuda.is_available")
+def test_train_device_arg_uses_all_visible_gpus(
+    mock_is_available,
+    mock_device_count,
+    mock_load_checkpoint_or_init_model,
+    is_cuda_available,
+    device_count,
+    requested_devices,
+    expected_device,
+):
+    model = MagicMock()
+    model.custom_callbacks.on_train_batch_start = MagicMock()
+    model.custom_callbacks.on_model_save = MagicMock()
+    model.train = MagicMock(return_value=MagicMock())
+
+    mock_load_checkpoint_or_init_model.return_value = (None, model)
+
+    mock_is_available.return_value = is_cuda_available
+    mock_device_count.return_value = device_count
+
+    run_context = MagicMock()
+    run_context.load_config.return_value = Config(
+        datasets=YoloDatasets(data_root=Path("/tmp")),
+        class_to_idx={"cat": 0},
+    )
+
+    os.environ["REQUESTED_GPU_COUNT"] = str(requested_devices)
+
+    if expected_device is RuntimeError:
+        with pytest.raises(RuntimeError) as re:
+            train(run_context)
+        assert (
+            str(re.value)
+            == f"Requested {requested_devices} GPUs, but only {device_count} are available"
+        )
+    else:
+        train(run_context)
+
+        model.train.assert_called_once()
+        assert model.train.call_args.kwargs["device"] == expected_device
+
+
 @patch("blueprint_yolo_obb.src.train.YOLO")
 @pytest.mark.parametrize(
     "cfg,expected_num_metrics,expected_num_legacy_metrics",
@@ -475,6 +529,26 @@ def test_callbacks_on_val_end():
             },
         ]
     )
+
+
+def test_trainer_registers_each_callback_once(monkeypatch):
+    import blueprint_yolo_obb.src.train as train_mod
+
+    monkeypatch.setattr(
+        train_mod.OBBTrainer, "__init__", lambda self, *args, **kwargs: None
+    )
+
+    calls = []
+
+    def mock_add_callback(self, name, fn):
+        calls.append(name)
+
+    monkeypatch.setattr(
+        train_mod.OBBTrainerWithCallbacks, "add_callback", mock_add_callback
+    )
+    cb = MagicMock()
+    train_mod.OBBTrainerWithCallbacks(callbacks=cb)
+    assert calls == ["on_train_batch_start", "on_model_save"]
 
 
 class ModelClass(torch.nn.Module):
