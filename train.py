@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import math
+import os
 import shutil
 import tempfile
 from collections import defaultdict
@@ -24,6 +25,7 @@ from blueprint_toolkit import (
     ModelConfigDict,
     RunContext,
     SaveMetricDict,
+    open_run_context,
 )
 from chariot_valor.lite import Loader as ValorLoader
 from chariot_valor.lite import TaskType
@@ -40,6 +42,10 @@ from blueprint_yolo_obb.src.yolo_yaml import get_yolo_file
 
 MODEL_PT_NAME = "model.pt"
 CHARIOT_VALOR_EVALUATIONS_FILE_NAME = "chariot_valor_evaluations.json.gz"
+
+
+def is_rank0():
+    return int(os.getenv("RANK", "0")) == 0
 
 
 def save_model(
@@ -192,12 +198,12 @@ class Callbacks:
             # on the final step
             return
         self.latest_val_step = self.global_step
-        self.run_context.save_metrics(
-            [
-                {"global_step": self.global_step, "tag": tag, "value": val}
-                for tag, val in validator.metrics.results_dict.items()
-            ]
-        )
+
+        metrics = [
+            SaveMetricDict(global_step=self.global_step, tag=tag, value=val)
+            for tag, val in validator.metrics.results_dict.items()
+        ]
+        self.run_context.save_metrics(metrics)
 
     def on_model_save(
         self,
@@ -284,6 +290,25 @@ class Callbacks:
             logging.info(f"Done saving checkpoint at step {self.global_step}")
 
 
+def create_callbacks_from_run() -> Callbacks:
+    """
+    Create callbacks from run_context in DDP workers
+    """
+    run_id = os.environ.get("RUN_ID")
+    if not run_id:
+        raise ValueError("RUN_ID environment variable is required")
+
+    # In local/open-source runtime, you can load a config from a file and pass it here
+    config = None
+    base_dir = None
+
+    with open_run_context(
+        run_id=run_id, config=config, base_dir=base_dir
+    ) as run_context:
+        config = Config.model_validate(run_context.load_config())
+        return Callbacks(run_context, config.ckpt_epoch_period)
+
+
 class CallbackYOLO(YOLO):
     def __init__(
         self,
@@ -309,19 +334,44 @@ class CallbackYOLO(YOLO):
 class OBBTrainerWithCallbacks(OBBTrainer):
     def __init__(
         self,
-        callbacks: Callbacks,
         cfg=DEFAULT_CFG,
         overrides=None,
         _callbacks=None,
+        callbacks: Callbacks | None = None,
     ):
+        # in DDP callbacks will be None so we need to recreate them from the run context
+        if callbacks is None:
+            callbacks = create_callbacks_from_run()
+
         self.custom_callbacks = callbacks
         super().__init__(cfg, overrides=overrides, _callbacks=_callbacks)
+
+        self.add_callback("on_train_batch_start", self._cb_on_train_batch_start)
+        self.add_callback("on_model_save", self._cb_on_model_save)
+
+    def _cb_on_train_batch_start(self, trainer):
+        if not is_rank0():
+            return
+        self.custom_callbacks.on_train_batch_start(trainer)
+
+    def _cb_on_model_save(self, trainer):
+        if not is_rank0():
+            return
+        model = trainer.model
+        # unwrap the model if it is wrapped in DDP
+        if hasattr(model, "module"):
+            model = model.module
+        idx_to_class = getattr(model, "names", None)
+        if idx_to_class is None:
+            return
+        self.custom_callbacks.on_model_save(trainer, idx_to_class)
 
     def get_validator(self):
         callbacks = get_default_callbacks()
         # Note: OBBTrainer doesn't propagate callbacks to the validator, so need to subclass
         # in order to setup this on_val_end callback
-        callbacks["on_val_end"].append(self.custom_callbacks.on_val_end)
+        if is_rank0():
+            callbacks["on_val_end"].append(self.custom_callbacks.on_val_end)
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
         validator = OBBValidator(
             self.test_loader,
@@ -627,24 +677,26 @@ def train(run_context: RunContext):
     else:
         raise ValueError(f"unexpected dataset type {type(config.datasets)}")
 
-    model.add_callback(
-        "on_train_batch_start", model.custom_callbacks.on_train_batch_start
-    )
     assert config.class_to_idx
     idx_to_class = config.idx_to_class or {i: c for c, i in config.class_to_idx.items()}
-    model.add_callback(
-        "on_model_save",
-        partial(
-            model.custom_callbacks.on_model_save,
-            idx_to_class=idx_to_class,
-        ),
-    )
 
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
             f.write(get_yolo_file(data_root.absolute(), idx_to_class))
             f.flush()
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                num_devices = torch.cuda.device_count()
+                requested_devices = int(os.getenv("REQUESTED_GPU_COUNT", "0"))
+                if num_devices != requested_devices:
+                    raise RuntimeError(
+                        f"Requested {requested_devices} GPUs, but only {num_devices} are available"
+                    )
+                if num_devices > 1:
+                    device = list(range(num_devices))
+                else:
+                    device = "cuda"
+            else:
+                device = "cpu"
 
             train_kwargs = {
                 # TODO: do we need to be specifying names, here?
